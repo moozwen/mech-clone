@@ -17,7 +17,7 @@
 #
 # ------------------------------------------------------------------------------
 
-from typing import Dict, Optional, Literal, List, Any
+from typing import Dict, Optional, Literal, List, Any, Callable
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 from langchain_groq import ChatGroq
@@ -32,6 +32,140 @@ from langchain_core.runnables import (
 )
 from langchain_core.output_parsers import StrOutputParser
 import os
+from functools import partial
+
+
+class ChatOpenRouter(ChatOpenAI):
+    def __init__(
+        self,
+        model_name: str,
+        openrouter_api_key: Optional[str] = None,
+        openrouter_api_base: str = "https://openrouter.ai/api/v1",
+        **kwargs,
+    ):
+        super().__init__(
+            model_name=model_name,
+            openai_api_key=openrouter_api_key or os.getenv("OPENROUTER_API_KEY"),
+            openai_api_base=openrouter_api_base,
+            **kwargs,
+        )
+
+
+class AgentFactory:
+    # ToDo: いずれか一つのAPIキーでも受け付けられるようにする。
+    def __init__(
+        self,
+        openrouter_api_key: str,
+    ):
+        self.openrouter_api_kei = openrouter_api_key
+        self.groq_api_key = groq_api_key
+
+    def create_openrouter_agent(self, model_name: str, **kwargs):
+        return ChatOpenRouter(
+            model_name=model_name,
+            openrouter_api_key=os.getenv("OPENROUTER_API_KEY"),
+            **kwargs
+        )
+
+    def crate_groq_agent(self, model_name: str, **kwargs):
+        return ChatGroq(model=model_name, **kwargs)
+
+
+# メイン処理は、MoAgentインスタンスを受け取って、MoAのコアロジックを実行する
+class MoAgent:
+    def __init__(
+        self,
+        main_agent: RunnableSerializable[Dict, str],
+        layer_agent: RunnableSerializable[Dict, Dict]
+    ):
+        self.main_agent = main_agent
+        self.layer_agent = layer_agent
+
+
+def configure_layer_agents(
+    layer_agent_config: Optional[Dict] = None,
+    provider: Literal["groq", "openrouter"] = "groq",
+) -> RunnableSerializable[Dict, Dict]:
+    if layer_agent_config is None:
+        layer_agent_config = get_default_layer_agent_config(provider=provider)
+
+    agent_factory = AgentFactory(
+        openrouter_api_key=os.getenv("OPENROUTER_API_KEY"),
+    )
+
+    create_agent_func = agent_factory.crate_groq_agent if provider == "groq" else agent_factory.create_openrouter_agent
+    parallel_chain_map = {
+        key: RunnablePassthrough() | partial(create_agent, create_client_func=create_agent_func, **value)
+        for key, value in layer_agent_config.items()
+    }
+
+    return parallel_chain_map | RunnableLambda(concat_responses)
+
+
+def get_default_layer_agent_config(provider: str) -> Dict:
+    if provider == "groq":
+        return {
+            "layer_agent_1": {
+                "system_prompt": SYSTEM_PROMPT,
+                "model_name": "llama3-8b-8192"
+            },
+            "layer_agent_2": {
+                "system_prompt": SYSTEM_PROMPT,
+                "model_name": "gemma-7b-it"
+            },
+            "layer_agent_3": {
+                "system_prompt": SYSTEM_PROMPT,
+                "model_name": "mixtral-8x7b-32768"
+            }
+        }
+    else:
+        return {
+            "layer_agent_1": {
+                "system_prompt": SYSTEM_PROMPT,
+                "model_name": "meta-llama/llama-3-8b-instruct:free"
+            },
+            "layer_agent_2": {
+                "system_prompt": SYSTEM_PROMPT,
+                "model_name": "google/gemma-2-9b-it:free"
+            },
+            "layer_agent_3": {
+                "system_prompt": SYSTEM_PROMPT,
+                "model_name": "nousresearch/nous-capybara-7b:free"
+            },
+        }
+
+
+def create_agent(
+    system_prompt: str,
+    create_agent_func: Callable[[str], Any],
+    model_name: str,
+    **llm_kwargs,
+) -> RunnableSerializable[Dict, str]:
+    prompt = build_prompt_template(system_prompt)
+    llm = create_agent_func(model_name=model_name, **llm_kwargs)
+    return prompt | llm | StrOutputParser()
+
+
+def build_prompt_template(system_prompt: str) -> ChatPromptTemplate:
+    return ChatPromptTemplate.from_messages([
+        ("system", system_prompt),
+        MessagesPlaceholder(variable_name="messages", optional=True),
+        ("human", "{input}")
+    ])
+
+
+def concat_responses(
+    inputs: Dict[str, str],
+    reference_system_prompt: Optional[str] = None
+) -> Dict:
+    reference_system_prompt = reference_system_prompt or REFERENCE_SYSTEM_PROMPT
+    responses = "\n".join([f"{i}. {out}" for i, out in enumerate(inputs.values())])
+    formatted_prompt = reference_system_prompt.format(responses=responses)
+    return {
+        "formatted_response": formatted_prompt,
+        "responses": list(inputs.values())
+    }
+
 
 SYSTEM_PROMPT = """\
 You are a personal assistant that is helpful.
@@ -56,27 +190,6 @@ class MOAgentConfig(BaseModel):
     layer_agent_config: Optional[Dict[str, Any]] = None
     reference_system_prompt: Optional[str] = None
     max_tokens: Optional[int] = None
-
-
-class ChatOpenRouter(ChatOpenAI):
-    openai_api_base: str
-    openai_api_key: str
-    model_name: str
-
-    def __init__(
-        self,
-        model_name: str,
-        openai_api_key: Optional[str] = None,
-        openai_api_base: str = "https://openrouter.ai/api/v1",
-        **kwargs,
-    ):
-        openai_api_key = openai_api_key or os.getenv("OPENROUTER_API_KEY")
-        super().__init__(
-            openai_api_base=openai_api_base,
-            openai_api_key=openai_api_key,
-            model_name=model_name,
-            **kwargs,
-        )
 
 
 load_dotenv()
@@ -240,41 +353,46 @@ class MOAgent:
 
         return chain
 
-    def chat(
-        self,
-        input: str,
-        messages: Optional[List[BaseMessage]] = None,
-        cycles: Optional[int] = None,
-        save: bool = True,
-        output_format: Literal["string", "json"] = "string",
-    ) -> str:
-        cycles = cycles or self.cycles
 
-        llm_inp = {
-            "input": input,
-            "messages": messages
-            or self.chat_memory.load_memory_variables({})["messages"],
-            "helper_response": "",
-        }
 
-        response = ""
 
-        for cyc in range(cycles):
-            layer_output = self.layer_agent.invoke(llm_inp)
-            l_frm_resp = layer_output["formatted_response"]
-            # l_resps = layer_output["responses"]
 
-            llm_inp = {
-                "input": input,
-                "messages": self.chat_memory.load_memory_variables({})["messages"],
-                "helper_response": l_frm_resp,
-            }
 
-            stream = self.main_agent.stream(llm_inp)
-            for chunk in stream:
-                response += chunk
+    # def chat(
+    #     self,
+    #     input: str,
+    #     messages: Optional[List[BaseMessage]] = None,
+    #     cycles: Optional[int] = None,
+    #     save: bool = True,
+    #     output_format: Literal["string", "json"] = "string",
+    # ) -> str:
+    #     cycles = cycles or self.cycles
 
-        if save:
-            self.chat_memory.save_context({"input": input}, {"output": response})
+    #     llm_inp = {
+    #         "input": input,
+    #         "messages": messages
+    #         or self.chat_memory.load_memory_variables({})["messages"],
+    #         "helper_response": "",
+    #     }
 
-        return response
+    #     response = ""
+
+    #     for cyc in range(cycles):
+    #         layer_output = self.layer_agent.invoke(llm_inp)
+    #         l_frm_resp = layer_output["formatted_response"]
+    #         # l_resps = layer_output["responses"]
+
+    #         llm_inp = {
+    #             "input": input,
+    #             "messages": self.chat_memory.load_memory_variables({})["messages"],
+    #             "helper_response": l_frm_resp,
+    #         }
+
+    #         stream = self.main_agent.stream(llm_inp)
+    #         for chunk in stream:
+    #             response += chunk
+
+    #     if save:
+    #         self.chat_memory.save_context({"input": input}, {"output": response})
+
+    #     return response
